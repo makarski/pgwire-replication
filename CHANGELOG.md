@@ -7,10 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [Unreleased]
+## [0.4.1] - 2026-09-21
 
 ### Added
 - **Startup `options` parameter**: `ReplicationConfig::options` / `with_options()` let callers set the startup `options` parameter on the replication connection, the same as `libpq`'s `options` connection parameter (or `PGOPTIONS`) on an ordinary connection. PostgreSQL honors `options` on replication connections too, so this is useful for pinning session GUCs (e.g. `DateStyle`, `IntervalStyle`) so that values decoded from the replication stream are rendered the same way as values read through a regular connection with the same GUCs pinned. Omitted from the startup message entirely when unset, so behavior is unchanged by default.
+
+### Fixed
+- Test-only clippy lint (byte-string literal) that landed after the `v0.4.0` tag and was therefore missing from the published 0.4.0 crate.
 
 ---
 
@@ -141,7 +144,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Fuzz testing for pgwire framing
 
 
-[Unreleased]: https://github.com/vnvo/pgwire-replication/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/vnvo/pgwire-replication/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/vnvo/pgwire-replication/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/vnvo/pgwire-replication/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/vnvo/pgwire-replication/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/vnvo/pgwire-replication/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/vnvo/pgwire-replication/compare/v0.2.0...v0.3.0
