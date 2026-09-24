@@ -653,21 +653,15 @@ async fn postgres_replication_invalid_slot_error() -> Result<()> {
     ))
     .await;
 
-    match result {
-        Ok(mut repl) => {
-            // Connection might succeed but first recv should fail
-            let recv_result = repl.recv().await;
-            anyhow::ensure!(
-                recv_result.is_err(),
-                "expected error when using nonexistent slot, got: {:?}",
-                recv_result
-            );
-            info!("invalid slot error surfaced on recv (as expected)");
-        }
-        Err(e) => {
-            info!("invalid slot error surfaced on connect (as expected): {e}");
-        }
-    }
+    let err = match result {
+        Ok(_) => anyhow::bail!("expected connect to fail for a nonexistent slot"),
+        Err(e) => e,
+    };
+    anyhow::ensure!(
+        matches!(err, pgwire_replication::PgWireError::Server(_)),
+        "expected a server error for a nonexistent slot, got: {err:?}"
+    );
+    info!("invalid slot error surfaced on connect (as expected): {err}");
 
     info!("invalid slot error test completed successfully");
     Ok(())

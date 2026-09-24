@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Changed
+- **`connect()` waits for the stream to start**: `ReplicationClient::connect` now returns once the server has accepted `START_REPLICATION`, so connection, TLS, authentication and slot errors are returned from `connect` as documented, instead of from the first `recv()`.
+
+### Added
+- **Connect timeout**: `ReplicationConfig::connect_timeout` / `with_connect_timeout()` bound that wait. On expiry the worker is aborted and `connect` returns an I/O error of kind `TimedOut`. Defaults to `None` (wait indefinitely).
+
+---
+
 ## [0.4.1] - 2026-09-21
 
 ### Added

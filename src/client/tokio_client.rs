@@ -6,10 +6,11 @@ use tokio::net::TcpStream;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 
-use tokio::sync::{mpsc, watch};
-use tokio::task::JoinHandle;
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::{JoinError, JoinHandle};
 
 use std::sync::Arc;
+use std::time::Duration;
 
 #[cfg(not(feature = "tls-rustls"))]
 use crate::config::SslMode;
@@ -68,15 +69,22 @@ pub struct ReplicationClient {
     progress: Arc<SharedProgress>,
     stop_tx: watch::Sender<bool>,
     metrics: Arc<ReplicationMetrics>,
-    join: Option<JoinHandle<std::result::Result<(), PgWireError>>>,
+    join: Option<WorkerHandle>,
 }
+
+type WorkerHandle = JoinHandle<std::result::Result<(), PgWireError>>;
 
 impl ReplicationClient {
     /// Connect to PostgreSQL and start streaming replication events.
     ///
     /// This establishes a TCP connection (optionally upgrading to TLS),
-    /// authenticates, and starts the replication stream. Events are buffered
-    /// in a channel of size `config.buffer_events`.
+    /// authenticates, and starts the replication stream. It returns once the
+    /// server has accepted `START_REPLICATION`, so a failure in any of those
+    /// steps is returned here rather than from the first
+    /// [`recv()`](Self::recv). Events are buffered in a channel of size
+    /// `config.buffer_events`.
+    ///
+    /// `config.connect_timeout` bounds the whole wait.
     ///
     /// # Errors
     ///
@@ -88,6 +96,7 @@ impl ReplicationClient {
     /// - Publication doesn't exist
     /// - Unix socket does not exist (when host starts with `/`)
     /// - TLS requested with Unix socket connection
+    /// - The stream did not start within `config.connect_timeout`
     pub async fn connect(cfg: ReplicationConfig) -> Result<Self> {
         let (tx, rx) = mpsc::channel(cfg.buffer_events);
 
@@ -95,6 +104,8 @@ impl ReplicationClient {
         let progress = Arc::new(SharedProgress::new(cfg.start_lsn));
 
         let (stop_tx, stop_rx) = watch::channel(false);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let connect_timeout = cfg.connect_timeout;
 
         let metrics = Arc::new(ReplicationMetrics::default());
 
@@ -109,13 +120,16 @@ impl ReplicationClient {
                 stop_rx,
                 tx,
                 metrics_for_worker,
-            );
+            )
+            .notify_ready(ready_tx);
             let res = run_worker(&mut worker, &cfg).await;
             if let Err(ref e) = res {
                 tracing::error!("replication worker terminated with error: {e}");
             }
             res
         });
+        let startup = AbortOnDrop(Some(join));
+        let join = await_stream_start(ready_rx, startup, connect_timeout).await?;
 
         Ok(Self {
             rx,
@@ -274,6 +288,56 @@ impl Drop for ReplicationClient {
     }
 }
 
+/// Aborts the worker unless startup hands it over to the client, so a timed
+/// out or cancelled `connect` does not leave the worker and its socket behind.
+struct AbortOnDrop(Option<WorkerHandle>);
+
+impl AbortOnDrop {
+    fn disarm(mut self) -> WorkerHandle {
+        self.0.take().expect("startup worker handle")
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(join) = self.0.take() {
+            join.abort();
+        }
+    }
+}
+
+/// Wait until the worker has started streaming, or return why it has not.
+async fn await_stream_start(
+    ready: oneshot::Receiver<()>,
+    startup: AbortOnDrop,
+    timeout: Option<Duration>,
+) -> Result<WorkerHandle> {
+    let started = match timeout {
+        Some(limit) => tokio::time::timeout(limit, ready).await.map_err(|_| {
+            PgWireError::Io(Arc::new(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("replication stream did not start within {limit:?}"),
+            )))
+        })?,
+        None => ready.await,
+    };
+    let join = startup.disarm();
+    match started {
+        Ok(()) => Ok(join),
+        Err(_) => Err(startup_failure(join.await)),
+    }
+}
+
+fn startup_failure(outcome: std::result::Result<Result<()>, JoinError>) -> PgWireError {
+    match outcome {
+        Ok(Err(e)) => e,
+        Ok(Ok(())) => {
+            PgWireError::Internal("replication worker exited before the stream started".into())
+        }
+        Err(e) => PgWireError::Task(format!("replication worker panicked: {e}")),
+    }
+}
+
 async fn run_worker(worker: &mut WorkerState, cfg: &ReplicationConfig) -> Result<()> {
     #[cfg(unix)]
     if cfg.is_unix_socket() {
@@ -314,5 +378,89 @@ async fn run_worker(worker: &mut WorkerState, cfg: &ReplicationConfig) -> Result
         }
         let mut s = tcp;
         worker.run_on_stream(&mut s).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    async fn local_server() -> (TcpListener, ReplicationConfig) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let cfg =
+            ReplicationConfig::new("127.0.0.1", "u", "p", "db", "slot", "pub").with_port(port);
+        (listener, cfg)
+    }
+
+    /// Wait for the peer to close the connection; `false` if it stays open.
+    async fn closed_by_peer(socket: &mut tokio::net::TcpStream) -> bool {
+        use tokio::io::AsyncReadExt;
+
+        let mut buf = [0u8; 1024];
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), socket.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => return true,
+                Ok(Ok(_)) => continue,
+                Err(_) => return false,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_connect_closes_the_startup_socket() {
+        let (listener, cfg) = local_server().await;
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            accepted_tx.send(()).unwrap();
+            closed_by_peer(&mut socket).await
+        });
+
+        let connecting = tokio::spawn(ReplicationClient::connect(cfg));
+        accepted_rx.await.unwrap();
+        connecting.abort();
+        let _ = connecting.await;
+
+        assert!(
+            server.await.unwrap(),
+            "cancelled connect left the startup socket open"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_times_out_when_the_server_never_answers() {
+        let (listener, cfg) = local_server().await;
+        let cfg = cfg.with_connect_timeout(Duration::from_millis(200));
+        let _held = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(socket);
+        });
+
+        let err = ReplicationClient::connect(cfg)
+            .await
+            .err()
+            .expect("timeout");
+        match err {
+            PgWireError::Io(io) => assert_eq!(io.kind(), std::io::ErrorKind::TimedOut),
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_returns_the_error_when_the_server_closes_before_streaming() {
+        let (listener, cfg) = local_server().await;
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            drop(socket);
+        });
+
+        let err = ReplicationClient::connect(cfg).await.err().expect("error");
+        assert!(
+            !matches!(&err, PgWireError::Io(io) if io.kind() == std::io::ErrorKind::TimedOut),
+            "expected the startup failure, got {err:?}"
+        );
     }
 }

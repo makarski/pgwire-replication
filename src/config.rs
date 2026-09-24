@@ -431,6 +431,16 @@ pub struct ReplicationConfig {
     ///
     /// Default: `None` (server defaults apply).
     pub options: Option<String>,
+
+    /// Longest [`ReplicationClient::connect`](crate::client::ReplicationClient::connect)
+    /// waits for the stream to start: TCP connect, TLS, authentication and
+    /// `START_REPLICATION` together.
+    ///
+    /// On expiry the worker is aborted and `connect` returns
+    /// [`PgWireError::Io`](crate::PgWireError::Io) of kind `TimedOut`.
+    ///
+    /// Default: `None` (wait indefinitely).
+    pub connect_timeout: Option<Duration>,
 }
 
 impl Default for ReplicationConfig {
@@ -451,6 +461,7 @@ impl Default for ReplicationConfig {
             buffer_events: 8192,
             binary: false,
             options: None,
+            connect_timeout: None,
         }
     }
 }
@@ -587,6 +598,22 @@ impl ReplicationConfig {
     /// Set the status update interval.
     pub fn with_status_interval(mut self, interval: Duration) -> Self {
         self.status_interval = interval;
+        self
+    }
+
+    /// Bound how long `connect` waits for the stream to start.
+    ///
+    /// # Example
+    /// ```
+    /// use std::time::Duration;
+    /// use pgwire_replication::config::ReplicationConfig;
+    ///
+    /// let config = ReplicationConfig::new("localhost", "u", "p", "db", "slot", "pub")
+    ///     .with_connect_timeout(Duration::from_secs(30));
+    /// assert_eq!(config.connect_timeout, Some(Duration::from_secs(30)));
+    /// ```
+    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = Some(timeout);
         self
     }
 
@@ -762,6 +789,14 @@ mod tests {
         let cfg = ReplicationConfig::new("h", "u", "p", "db", "slot", "pub")
             .with_options("-c datestyle=ISO,MDY");
         assert_eq!(cfg.options.as_deref(), Some("-c datestyle=ISO,MDY"));
+    }
+
+    #[test]
+    fn connect_timeout_defaults_none_and_builder_sets_it() {
+        assert_eq!(ReplicationConfig::default().connect_timeout, None);
+        let cfg = ReplicationConfig::new("h", "u", "p", "db", "slot", "pub")
+            .with_connect_timeout(Duration::from_secs(5));
+        assert_eq!(cfg.connect_timeout, Some(Duration::from_secs(5)));
     }
 
     #[test]

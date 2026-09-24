@@ -2,7 +2,7 @@ use bytes::Bytes;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 use super::metrics::ReplicationMetrics;
@@ -133,6 +133,7 @@ pub struct WorkerState {
     stop_rx: watch::Receiver<bool>,
     out: mpsc::Sender<std::result::Result<ReplicationEvent, PgWireError>>,
     metrics: Arc<ReplicationMetrics>,
+    ready: Option<oneshot::Sender<()>>,
 }
 
 impl WorkerState {
@@ -149,7 +150,14 @@ impl WorkerState {
             stop_rx,
             out,
             metrics,
+            ready: None,
         }
+    }
+
+    /// Signal `ready` once the server has accepted `START_REPLICATION`.
+    pub(crate) fn notify_ready(mut self, ready: oneshot::Sender<()>) -> Self {
+        self.ready = Some(ready);
+        self
     }
 
     /// Run the replication protocol on the given stream.
@@ -164,6 +172,9 @@ impl WorkerState {
         self.startup(&mut stream).await?;
         self.authenticate(&mut stream).await?;
         self.start_replication(&mut stream).await?;
+        if let Some(ready) = self.ready.take() {
+            let _ = ready.send(());
+        }
         self.stream_loop(&mut stream).await
     }
 
