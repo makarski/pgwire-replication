@@ -452,6 +452,17 @@ pub struct ReplicationConfig {
     ///
     /// Default: `None` (no check).
     pub expected_system_id: Option<String>,
+
+    /// Largest replication message accepted, in bytes.
+    ///
+    /// The worker sizes its buffer from the length the server announces, so
+    /// this bounds the memory a single message can take. A message over the
+    /// limit ends the stream with a protocol error rather than being buffered.
+    /// A large row or a large logical message is one message, so set this
+    /// above the largest the publication can produce.
+    ///
+    /// Default: [`MAX_MESSAGE_SIZE`](crate::protocol::framing::MAX_MESSAGE_SIZE) (1 GiB)
+    pub max_message_size: usize,
 }
 
 impl Default for ReplicationConfig {
@@ -474,6 +485,7 @@ impl Default for ReplicationConfig {
             options: None,
             connect_timeout: None,
             expected_system_id: None,
+            max_message_size: crate::protocol::framing::MAX_MESSAGE_SIZE,
         }
     }
 }
@@ -683,6 +695,21 @@ impl ReplicationConfig {
         self
     }
 
+    /// Set the largest replication message accepted, in bytes.
+    ///
+    /// # Example
+    /// ```
+    /// use pgwire_replication::config::ReplicationConfig;
+    ///
+    /// let config = ReplicationConfig::new("localhost", "u", "p", "db", "slot", "pub")
+    ///     .with_max_message_size(64 * 1024 * 1024);
+    /// assert_eq!(config.max_message_size, 64 * 1024 * 1024);
+    /// ```
+    pub fn with_max_message_size(mut self, bytes: usize) -> Self {
+        self.max_message_size = bytes;
+        self
+    }
+
     /// Returns the connection string for display (password masked).
     ///
     /// Useful for logging without exposing credentials.
@@ -808,6 +835,17 @@ mod tests {
         assert!(!ReplicationConfig::default().binary);
         let cfg = ReplicationConfig::new("h", "u", "p", "db", "slot", "pub").with_binary(true);
         assert!(cfg.binary);
+    }
+
+    #[test]
+    fn max_message_size_defaults_to_the_protocol_limit_and_builder_sets_it() {
+        assert_eq!(
+            ReplicationConfig::default().max_message_size,
+            crate::protocol::framing::MAX_MESSAGE_SIZE
+        );
+        let cfg =
+            ReplicationConfig::new("h", "u", "p", "db", "slot", "pub").with_max_message_size(1024);
+        assert_eq!(cfg.max_message_size, 1024);
     }
 
     #[test]
