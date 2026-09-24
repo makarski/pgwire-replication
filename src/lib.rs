@@ -59,7 +59,6 @@
 
 #![warn(
     clippy::all,
-    clippy::cargo,
     clippy::perf,
     clippy::style,
     clippy::correctness,
