@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 - **Connect timeout**: `ReplicationConfig::connect_timeout` / `with_connect_timeout()` bound that wait. On expiry the worker is aborted and `connect` returns an I/O error of kind `TimedOut`. Defaults to `None` (wait indefinitely).
+- **Server identity**: the worker runs `IDENTIFY_SYSTEM` before `START_REPLICATION`, and `ReplicationClient::server_identity()` returns the reported system identifier, timeline, WAL position and database as a `ServerIdentity`.
+- **Expected system identifier**: `ReplicationConfig::expected_system_id` / `with_expected_system_id()` make `connect` fail with a protocol error, before replication starts, when the server reports a different system identifier. This keeps a slot of the same name on another cluster from being read or acknowledged. Defaults to `None` (no check).
 
 ---
 

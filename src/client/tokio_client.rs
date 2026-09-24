@@ -1,6 +1,7 @@
 use crate::config::ReplicationConfig;
 use crate::error::{PgWireError, Result};
 use crate::lsn::Lsn;
+use crate::protocol::messages::ServerIdentity;
 
 use tokio::net::TcpStream;
 #[cfg(unix)]
@@ -70,6 +71,7 @@ pub struct ReplicationClient {
     stop_tx: watch::Sender<bool>,
     metrics: Arc<ReplicationMetrics>,
     join: Option<WorkerHandle>,
+    identity: ServerIdentity,
 }
 
 type WorkerHandle = JoinHandle<std::result::Result<(), PgWireError>>;
@@ -129,7 +131,7 @@ impl ReplicationClient {
             res
         });
         let startup = AbortOnDrop(Some(join));
-        let join = await_stream_start(ready_rx, startup, connect_timeout).await?;
+        let (join, identity) = await_stream_start(ready_rx, startup, connect_timeout).await?;
 
         Ok(Self {
             rx,
@@ -137,7 +139,14 @@ impl ReplicationClient {
             stop_tx,
             metrics,
             join: Some(join),
+            identity,
         })
+    }
+
+    /// The server identity reported by `IDENTIFY_SYSTEM` before the stream
+    /// started.
+    pub fn server_identity(&self) -> &ServerIdentity {
+        &self.identity
     }
 
     /// Receive the next replication event.
@@ -308,10 +317,10 @@ impl Drop for AbortOnDrop {
 
 /// Wait until the worker has started streaming, or return why it has not.
 async fn await_stream_start(
-    ready: oneshot::Receiver<()>,
+    ready: oneshot::Receiver<ServerIdentity>,
     startup: AbortOnDrop,
     timeout: Option<Duration>,
-) -> Result<WorkerHandle> {
+) -> Result<(WorkerHandle, ServerIdentity)> {
     let started = match timeout {
         Some(limit) => tokio::time::timeout(limit, ready).await.map_err(|_| {
             PgWireError::Io(Arc::new(std::io::Error::new(
@@ -323,7 +332,7 @@ async fn await_stream_start(
     };
     let join = startup.disarm();
     match started {
-        Ok(()) => Ok(join),
+        Ok(identity) => Ok((join, identity)),
         Err(_) => Err(startup_failure(join.await)),
     }
 }

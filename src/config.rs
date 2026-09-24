@@ -441,6 +441,17 @@ pub struct ReplicationConfig {
     ///
     /// Default: `None` (wait indefinitely).
     pub connect_timeout: Option<Duration>,
+
+    /// Refuse to stream unless the server's `IDENTIFY_SYSTEM` system
+    /// identifier equals this value.
+    ///
+    /// Checked before `START_REPLICATION`, so a slot of the same name on a
+    /// different cluster answering at the same address is never read or
+    /// acknowledged. On mismatch `connect` returns
+    /// [`PgWireError::Protocol`](crate::PgWireError::Protocol).
+    ///
+    /// Default: `None` (no check).
+    pub expected_system_id: Option<String>,
 }
 
 impl Default for ReplicationConfig {
@@ -462,6 +473,7 @@ impl Default for ReplicationConfig {
             binary: false,
             options: None,
             connect_timeout: None,
+            expected_system_id: None,
         }
     }
 }
@@ -614,6 +626,21 @@ impl ReplicationConfig {
     /// ```
     pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = Some(timeout);
+        self
+    }
+
+    /// Require the server to report this `IDENTIFY_SYSTEM` system identifier.
+    ///
+    /// # Example
+    /// ```
+    /// use pgwire_replication::config::ReplicationConfig;
+    ///
+    /// let config = ReplicationConfig::new("localhost", "u", "p", "db", "slot", "pub")
+    ///     .with_expected_system_id("7412345678901234567");
+    /// assert_eq!(config.expected_system_id.as_deref(), Some("7412345678901234567"));
+    /// ```
+    pub fn with_expected_system_id(mut self, system_id: impl Into<String>) -> Self {
+        self.expected_system_id = Some(system_id.into());
         self
     }
 
@@ -797,6 +824,14 @@ mod tests {
         let cfg = ReplicationConfig::new("h", "u", "p", "db", "slot", "pub")
             .with_connect_timeout(Duration::from_secs(5));
         assert_eq!(cfg.connect_timeout, Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn expected_system_id_defaults_none_and_builder_sets_it() {
+        assert_eq!(ReplicationConfig::default().expected_system_id, None);
+        let cfg = ReplicationConfig::new("h", "u", "p", "db", "slot", "pub")
+            .with_expected_system_id("42");
+        assert_eq!(cfg.expected_system_id.as_deref(), Some("42"));
     }
 
     #[test]

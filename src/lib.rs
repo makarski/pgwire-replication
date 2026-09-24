@@ -87,3 +87,4 @@ pub use client::{
 pub use config::{Publication, ReplicationConfig, SslMode, TlsConfig};
 pub use error::{PgWireError, Result};
 pub use lsn::Lsn;
+pub use protocol::messages::ServerIdentity;

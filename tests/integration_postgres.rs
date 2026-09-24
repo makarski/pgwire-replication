@@ -612,6 +612,58 @@ async fn postgres_replication_batch_insert() -> Result<()> {
     Ok(())
 }
 
+/// `connect` reports the server identity, and refuses a different cluster
+/// before replication starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_replication_server_identity() -> Result<()> {
+    init_tracing();
+
+    let host_port: u16 = std::env::var("PG_ITEST_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(get_available_port);
+
+    let image = postgres_image(host_port);
+    let container = image.start().await.expect("start postgres");
+    follow_container_logs(&container).await;
+
+    let client = wait_for_pg_ready(host_port, Duration::from_secs(30)).await?;
+    setup_publication_and_slot(&client, "slot_identity", "pub_identity").await?;
+    let system_id: String = client
+        .query_one(
+            "SELECT system_identifier::text FROM pg_control_system()",
+            &[],
+        )
+        .await?
+        .get(0);
+    let base_lsn = current_wal_lsn(&client).await?;
+
+    let repl = ReplicationClient::connect(
+        replication_config(host_port, "slot_identity", "pub_identity", base_lsn, None)
+            .with_expected_system_id(system_id.clone()),
+    )
+    .await?;
+    anyhow::ensure!(
+        repl.server_identity().system_id == system_id,
+        "expected system id {system_id}, got {:?}",
+        repl.server_identity()
+    );
+    repl.stop();
+    let _ = repl.join().await;
+
+    let mismatch = ReplicationClient::connect(
+        replication_config(host_port, "slot_identity", "pub_identity", base_lsn, None)
+            .with_expected_system_id("1"),
+    )
+    .await;
+    anyhow::ensure!(
+        matches!(mismatch, Err(pgwire_replication::PgWireError::Protocol(_))),
+        "expected a system identifier mismatch, got: {:?}",
+        mismatch.err()
+    );
+    Ok(())
+}
+
 /// Test error handling: connecting with a nonexistent slot should fail.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_replication_invalid_slot_error() -> Result<()> {

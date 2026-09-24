@@ -13,7 +13,7 @@ use crate::protocol::framing::{
     read_backend_message, write_copy_data, write_copy_done, write_password_message, write_query,
     write_startup_message, MessageReader,
 };
-use crate::protocol::messages::{parse_auth_request, parse_error_response};
+use crate::protocol::messages::{parse_auth_request, parse_error_response, ServerIdentity};
 use crate::protocol::replication::{
     encode_standby_status_update, parse_copy_data, ReplicationCopyData, PG_EPOCH_MICROS,
 };
@@ -133,7 +133,7 @@ pub struct WorkerState {
     stop_rx: watch::Receiver<bool>,
     out: mpsc::Sender<std::result::Result<ReplicationEvent, PgWireError>>,
     metrics: Arc<ReplicationMetrics>,
-    ready: Option<oneshot::Sender<()>>,
+    ready: Option<oneshot::Sender<ServerIdentity>>,
 }
 
 impl WorkerState {
@@ -154,8 +154,9 @@ impl WorkerState {
         }
     }
 
-    /// Signal `ready` once the server has accepted `START_REPLICATION`.
-    pub(crate) fn notify_ready(mut self, ready: oneshot::Sender<()>) -> Self {
+    /// Send the server identity on `ready` once the server has accepted
+    /// `START_REPLICATION`.
+    pub(crate) fn notify_ready(mut self, ready: oneshot::Sender<ServerIdentity>) -> Self {
         self.ready = Some(ready);
         self
     }
@@ -171,9 +172,11 @@ impl WorkerState {
         let mut stream = BufReader::with_capacity(128 * 1024, stream);
         self.startup(&mut stream).await?;
         self.authenticate(&mut stream).await?;
+        let identity = self.identify_system(&mut stream).await?;
+        self.check_system_id(&identity)?;
         self.start_replication(&mut stream).await?;
         if let Some(ready) = self.ready.take() {
-            let _ = ready.send(());
+            let _ = ready.send(identity);
         }
         self.stream_loop(&mut stream).await
     }
@@ -195,6 +198,40 @@ impl WorkerState {
             params.push(("options", options));
         }
         write_startup_message(stream, 196608, &params).await
+    }
+
+    /// Ask the server who it is with `IDENTIFY_SYSTEM`.
+    async fn identify_system<S: AsyncRead + AsyncWrite + Unpin>(
+        &self,
+        stream: &mut S,
+    ) -> Result<ServerIdentity> {
+        write_query(stream, "IDENTIFY_SYSTEM").await?;
+        let mut identity = None;
+        loop {
+            let msg = read_backend_message(stream).await?;
+            match msg.tag {
+                b'D' => identity = Some(ServerIdentity::from_data_row(&msg.payload)?),
+                b'E' => return Err(PgWireError::Server(parse_error_response(&msg.payload))),
+                b'Z' => {
+                    return identity.ok_or_else(|| {
+                        PgWireError::Protocol("IDENTIFY_SYSTEM returned no row".into())
+                    })
+                }
+                _ => continue, // RowDescription, CommandComplete, Notice, ParameterStatus
+            }
+        }
+    }
+
+    fn check_system_id(&self, identity: &ServerIdentity) -> Result<()> {
+        match self.cfg.expected_system_id.as_deref() {
+            Some(expected) if expected != identity.system_id => {
+                Err(PgWireError::Protocol(format!(
+                    "server system identifier {} does not match the expected {expected}",
+                    identity.system_id
+                )))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Start the logical replication stream.
@@ -976,6 +1013,60 @@ mod tests {
             sent.contains("-c datestyle=ISO,MDY -c intervalstyle=iso_8601"),
             "startup message missing options value: {sent:?}"
         );
+    }
+
+    fn backend_frame(tag: u8, payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![tag];
+        frame.extend_from_slice(&((payload.len() + 4) as i32).to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    fn identify_system_reply(system_id: &str) -> Vec<u8> {
+        let mut row = 4i16.to_be_bytes().to_vec();
+        for value in [system_id, "1", "0/16B3748", "postgres"] {
+            row.extend_from_slice(&(value.len() as i32).to_be_bytes());
+            row.extend_from_slice(value.as_bytes());
+        }
+        let mut reply = backend_frame(b'T', &[0, 0]);
+        reply.extend(backend_frame(b'D', &row));
+        reply.extend(backend_frame(b'C', b"IDENTIFY_SYSTEM\0"));
+        reply.extend(backend_frame(b'Z', b"I"));
+        reply
+    }
+
+    #[tokio::test]
+    async fn identify_system_reads_the_server_identity() {
+        use tokio::io::AsyncWriteExt;
+
+        let (worker, _stop_tx, _rx) = test_worker(ReplicationConfig::default());
+        let (mut worker_end, mut server) = tokio::io::duplex(64 * 1024);
+        server
+            .write_all(&identify_system_reply("7412345678901234567"))
+            .await
+            .unwrap();
+
+        let identity = worker.identify_system(&mut worker_end).await.unwrap();
+        assert_eq!(identity.system_id, "7412345678901234567");
+        assert_eq!(identity.timeline, 1);
+        assert!(worker.check_system_id(&identity).is_ok());
+    }
+
+    #[tokio::test]
+    async fn check_system_id_refuses_a_different_cluster() {
+        use tokio::io::AsyncWriteExt;
+
+        let cfg = ReplicationConfig::default().with_expected_system_id("1111");
+        let (worker, _stop_tx, _rx) = test_worker(cfg);
+        let (mut worker_end, mut server) = tokio::io::duplex(64 * 1024);
+        server
+            .write_all(&identify_system_reply("2222"))
+            .await
+            .unwrap();
+
+        let identity = worker.identify_system(&mut worker_end).await.unwrap();
+        let err = worker.check_system_id(&identity).unwrap_err();
+        assert!(matches!(err, PgWireError::Protocol(_)), "got {err:?}");
     }
 
     #[tokio::test]
